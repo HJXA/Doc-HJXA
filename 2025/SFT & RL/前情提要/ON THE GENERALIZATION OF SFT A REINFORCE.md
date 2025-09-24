@@ -1,3 +1,83 @@
+# 一行代码解决SFT泛化性
+
+## 背景
+
+近期，Chu等人在文本和视觉任务上对SFT与RL进行了系统性对比，**证实了“SFT侧重记忆，而RL侧重泛化”这一结论**。更重要的是，他们还发现，SFT作为初始化步骤对稳定输出格式至关重要，唯有如此，后续的RL训练才能有效进行
+
+有趣的是，我们提出的方法所设计的交叉熵（CE）损失，与著名的焦点损失（Focal Loss）（Lin et al., 2017）呈截然相反的思路。我们修改后的交叉熵损失为$\mathcal{-p \log (p)}$，而焦点损失为$\mathcal{-(1-p)^{\gamma} \log (p)}$。焦点损失通过刻意降低分类效果好的样本权重，以提升对少数类样本的性能；而我们则通过刻意降低分类效果差的样本权重，以提升模型的泛化能力。这种差异或许反映了大语言模型时代的一个根本性转变：在这一时代，欠拟合已不再是主要问题，过拟合反而更为突出。
+
+## 预备知识
+### 监督微调（SFT）
+设$\mathcal{D}=\{(x, y^{*})\}$表示专家演示语料库，其中$y^{*}$是查询$x$对应的完整参考响应。监督微调（SFT）的目标是最小化句子级交叉熵，其损失函数定义为：  
+ $$\mathcal{L}_{SFT}(\theta)=\mathbb{E}_{\left(x, y^{*}\right) \sim \mathcal{D}}\left[-log \pi_{\theta}\left(y^{*} | x\right)\right] . $$
+
+其梯度为：  
+ $$\nabla_{\theta} \mathcal{L}_{SFT}(\theta)=\mathbb{E}_{\left(x, y^{*}\right) \sim \mathcal{D}}\left[-\nabla_{\theta} log \pi_{\theta}\left(y^{*} | x\right)\right] . $$
+
+### 强化学习（RL）
+设$y$为从策略$\pi_{\theta}(\cdot | x)$中采样得到的、对应查询$x$的响应。给定奖励函数$r(x, y) \in \mathbb{R}$，策略目标函数定义为：  
+ $$J(\theta)=\mathbb{E}_{x \sim \mathcal{D}_{x}, y \sim \pi_{\theta}(\cdot | x)}[r(x, y)] . $$
+
+其句子级策略梯度为：  
+ $$\nabla_{\theta} J(\theta)=\mathbb{E}_{x \sim \mathcal{D}_{x}, y \sim \pi_{\theta}(\cdot | x)}\left[\nabla_{\theta} log \pi_{\theta}(y | x) r(x, y)\right] . $$
+
+
+## 公式
+
+公式2（即SFT梯度公式）是在固定演示分布下计算的。我们通过引入一个重要性权重（用于比较专家分布（狄拉克delta分布）与模型分布），将其转换为在线策略期望，具体形式如下：  
+ $$\mathbb{E}_{\left(x, y^{*}\right) \sim \mathcal{D}}\left[-\nabla_{\theta} log \pi_{\theta}\left(y^{*} | x\right)\right]=\mathbb{E}_{x \sim \mathcal{D}_{x}} \underbrace{\mathbb{E}_{y \sim \pi_{\theta}(\cdot | x)} \frac{\mathbb{I}\left[y=y^{*}\right]}{\pi_{\theta}(y | x)}\left[-\nabla_{\theta} log \pi_{\theta}(y | x)\right]}_{重采样+重加权 } (5) $$
+
+其中，$\mathbb{I}\left[y=y^{*}\right]$为指示函数（当$y=y^{*}$时取值为1，否则为0）。
+
+定义辅助变量：  
+ $$w(y | x)=\frac{1}{\pi_{\theta}(y | x)}, r(x, y)=\mathbb{I}\left[y=y^{*}\right], $$
+
+将公式5用上述辅助变量重新整理后，可得到如下形式：  
+ $$\nabla_{\theta} \mathcal{L}_{SFT}(\theta)=-\mathbb{E}_{x \sim \mathcal{D}_{x}, y \sim \pi_{\theta}(\cdot | x)}\left[w(y | x) \nabla_{\theta} log \pi_{\theta}(y | x) r(x, y)\right] . (6) $$
+
+此时，SFT梯度的形式与公式4（即RL策略梯度公式）高度一致。由此可见，传统SFT本质上是一种在线策略梯度方法——其奖励为“匹配专家轨迹的指示函数”，但受限于一个重要性权重$1/\pi_{\theta}$的偏倚影响。
+
+在SFT场景中，奖励信号的稀疏性不可避免，而我们发现，重要性采样权重$1/\pi_{\theta}$正是导致SFT泛化能力弱于RL的根本原因之一。当模型对专家响应的赋值概率较低时，权重$w$会显著增大，从RL的视角来看，这将导致奖励估计出现无界性和高方差问题。而奖励函数的极端稀疏性（仅当模型输出与专家输出完全匹配时，$r(x, y)=\mathbb{I}\left[y=y^{*}\right]$才非零）会进一步加剧这一问题。最终，优化过程会倾向于过拟合到罕见的“完全匹配演示样本”，从而损害模型对训练数据之外场景的泛化能力。
+
+据此，我们得到最终的DFT损失形式：  
+ $$\mathcal{L}_{DFT}(\theta)=\mathbb{E}_{\left(x, y^{*}\right) \sim \mathcal{D}}\left[-\sum_{t=1}^{\left|y^{*}\right|} sg\left(\pi_{\theta}\left(y_{t}^{*} | y_{<t}^{*}, x\right)\right) \cdot log \pi_{\theta}\left(y_{t}^{*} | y_{<t}^{*}, x\right)\right] . $$
+
+即$\mathcal{-p \log (p)}$
+
+## 实验
+
+#### 数据集与模型
+我们使用NuminaMath CoT数据集（LI等人，2024）进行训练，该数据集包含约86万个数学问题及其对应解答，数据来源涵盖中国高中数学练习题、美国及国际数学奥林匹克竞赛题目等。为高效利用计算资源，我们从数据集中随机抽取10万个样本用于训练——这一规模已足够，因为评估精度曲线显示，所有方法在数据集尚未完全使用时便已收敛。  
+我们在多个最先进模型上开展实验，包括Qwen2.5-Math-1.5B、Qwen2.5-Math-7B（Qwen团队，2024a）、LLaMA-3.2-3B、LLaMA-3.1-8B（Dubey等人，2024）以及DeepSeekMath-7B-Base（Shao等人，2024）。
+
+#### 训练细节
+我们的实现基于verl框架（Sheng等人，2025），并采用推荐的SFT超参数。具体而言，所有模型均使用AdamW优化器，学习率设为$5 ×10^{-5}$；仅LLaMA-3.1-8B模型采用更低的学习率（$2 ×10^{-5}$）。迷你批次大小（mini-batch size）设为256，最大输入长度为2048个token。学习率采用余弦衰减调度，预热比例（warm-up ratio）为0.1。  
+为进行对比，我们还纳入了同期提出的重要性加权SFT（iw-SFT，Qin & Springenberg，2025）方法。除训练轮数（epoch）设为1外，其余所有训练设置均遵循原论文报告的参数。
+
+#### 评估设置
+在数学推理任务中，我们在多个已确立的基准上进行评估，包括Math500（Hendrycks等人）、Minerva Math（Lewkowycz等人，2022）、奥林匹克基准（AI Mathematical Olympiad，2024）、2024年美国数学邀请赛（AIME 2024，American Institute of Mathematics，2024）及2023年美国数学竞赛（AMC 2023，Mathematical Association of America，2023）。  
+所有模型均使用默认对话模板及思维链（Chain-of-Thought，CoT）提示，以激发逐步推理过程。报告的所有结果均为16次解码运行的平均精度，解码时温度（temperature）设为1.0，最大生成长度为4096个token。
+
+### 4.2 探索实验——离线RL设置
+
+#### 数据准备
+我们探索了DFT在离线RL场景中的适用性——与SFT场景相比，该场景下奖励信号的稀疏性问题可得到缓解。具体而言，我们采用了常用的拒绝采样微调（RFT）框架（Dong等人，2023；Ahn等人，2024）。参照4.1节的设置，我们从基础模型中为1万个数学问题生成响应（温度设为1.0，每个问题生成4个响应）。通过数学验证识别正确响应并将其作为训练数据，最终得到约14万个训练样本。在DPO训练中，我们从生成的响应中构建了10万个正负偏好对。
+
+#### 训练细节
+所有实验均基于Qwen2.5-Math-1.5B模型开展。我们将DFT与代表性离线RL方法（包括DPO（Rafailov等人，2023）、RFT（Dong等人，2023；Ahn等人，2024））及在线RL方法（PPO（Schulman等人，2017）、GRPO（Shao等人，2024））进行对比。  
+RFT与DFT的训练设置遵循4.1节的配置；DPO训练基于ms-swift框架（Zhao等人，2024），学习率设为$1 ×10^{-6}$，批次大小为128，预热比例为0.05；PPO与GRPO训练基于verl框架（Sheng等人，2025），学习率设为$1 ×10^{-6}$，批次大小为256，预热比例为0.1，且GRPO的每个输入对应生成4个响应（$n=4$）。
+
+#### 结果
+在离线强化学习场景中，DFT表现最佳，性能超过所有离线及在线RL基准方法。如表3所示，DFT的平均得分为35.43分，比最佳离线方法RFT（23.97分）高出11.46分，甚至超过性能最强的在线RL算法GRPO（32.00分）3.43分。DFT在所有5个基准上均表现优异：  
+- 在Math500上，DFT得分为64.71分，略高于GRPO（62.86分），且优于PPO（56.10分）与RFT（48.23分）；  
+- 在高难度基准上的优势更为显著：在AMC 2023上，DFT得分为48.44分，比GRPO高7.19分，比RFT高17.66分；在Minerva Math上，DFT得分为25.16分，比GRPO（18.93分）高6.23分，比PPO（15.41分）高9.75分，且与所有离线基准方法的差距更大。
+
+我们还在离线场景下将DFT与同期的iw-SFT（Qin & Springenberg，2025）方法进行了对比。尽管iw-SFT在部分数据集上表现具有竞争力（如Math500得60.80分、AMC 2023得44.21分），但其整体平均性能（31.86分）仍比DFT低3.57分。此外，相较于其在标准SFT场景下的性能，iw-SFT在离线RL场景中的提升十分微弱——在离线RL场景中平均得分为31.86分，而在SFT场景中为30.28分，仅提升1.58分。这与DFT的提升幅度（从30.67分提升至35.43分，+4.76分）形成鲜明对比。这些结果表明，iw-SFT难以在离线约束下有效利用奖励监督信号，而DFT则能稳定地将这类信号转化为更稳健的泛化能力与更优的任务性能。
+
+这些结果凸显了DFT作为简单高效微调策略的优势。尽管DFT无需迭代式奖励建模或环境交互，但在特定规模训练集下，其提供的学习信号强度超过了DPO/RFT等离线方法及PPO/GRPO等在线策略优化算法。这表明，在偏好监督信号可获取、但奖励建模或在线响应采样成本高或不可行的领域，DFT可作为传统RL流程的更高效、更具扩展性的替代方案。
+
+
+
 # 摘要
 我们针对大语言模型（Large Language Model, LLM）的监督微调（Supervised Fine-Tuning, SFT）提出了一种简单但具有理论依据的改进方法，以解决其相较于强化学习（Reinforcement Learning, RL）泛化能力有限的问题。通过数学分析，我们发现标准SFT的梯度隐含编码了一种有问题的奖励结构，这种结构可能会严重限制模型的泛化能力。为修正这一问题，我们提出了动态微调（Dynamic Fine-Tuning, DFT）方法：通过利用token的概率对目标函数进行动态缩放，来稳定每个token的梯度更新。值得注意的是，这一仅需一行代码的改动，在多个具有挑战性的基准测试和基础模型上均显著优于标准SFT，展现出大幅提升的泛化能力。此外，我们的方法在离线强化学习场景中也取得了具有竞争力的结果，为相关任务提供了一种有效且更简洁的替代方案。本研究搭建了理论洞见与实践解决方案之间的桥梁，显著推动了SFT的性能提升。相关代码将在https://github.com/yongliang-wu/DFT 发布。
 

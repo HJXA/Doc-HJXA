@@ -1,3 +1,142 @@
+# 新型SFT（新的SFT需要做的实验）
+
+## 实验设置总结
+
+新的SFT算法
+1.与其他SFT的熵值与性能变化，详细的在各个任务上的评估
+2.与RL的配合能力：熵值，更高的熵值代表更高的预留空间，详细评估具体的任务指标（DAPO）
+3.人类对齐领域的实验（DPO）
+4.深度分析：剪辑参数的影响
+
+## 问题SFT在下游任务的表现
+
+## 公式
+
+### 监督微调（Supervised Fine-tuning）
+监督微调的训练目标是最小化模型预测token分布与真实token之间的交叉熵损失。该损失的形式化定义如下：
+$$
+L^{SFT}(\theta)=-\hat{\mathbb{E}}_{(s_{t}, a_{t}^{*}) \sim \mathcal{D}}\left[\log \pi_{\theta}\left(a_{t}^{*} | s_{t}\right)\right] \quad (1)
+$$
+其中，\((s_t, a_t^*)\)对从离线数据集\(\mathcal{D}\)中采样得到。
+
+### 策略梯度（Policy Gradient）
+与之不同，策略梯度直接从当前策略\(\pi_\theta\)与环境交互产生的轨迹中采样数据。利用策略梯度定理，可将相应的损失函数定义为：
+$$
+L^{PG}(\theta)=\hat{\mathbb{E}}_{(s_{t}, a_{t}) \sim \pi_{\theta}}\left[\log \pi_{\theta}\left(a_{t} | s_{t}\right) \hat{A}_{t}\right] \quad (2)
+$$
+其中，\(\hat{A}_t\)为时刻\(t\)的估计优势函数。
+
+从这一视角来看，监督微调可视为策略梯度的一种特殊情况：其数据采样来源于固定的离线数据集\(\mathcal{D}\)，且对于真实动作（ground-truth action），优势函数固定为\(\hat{A}_t=1\)——这一设定本质上是最大化专家token的似然概率。
+
+
+### 2.3 近邻策略优化
+#### 信任域策略优化（Trust Region Policy Optimization）
+信任域策略优化（TRPO，Schulman et al., 2015）通过利用基于旧策略\(\pi_{\theta_{old}}\)收集的轨迹来最大化代理目标，并引入重要性采样对这些样本进行重加权，以评估新策略\(\pi_\theta\)，其代理目标函数如下：
+$$
+L^{CPI}(\theta)=\hat{\mathbb{E}}_{(s_{t}, a_{t}) \sim \pi_{\theta_{old}}}\left[\frac{\pi_{\theta}\left(a_{t} | s_{t}\right)}{\pi_{\theta_{old}}\left(a_{t} | s_{t}\right)} \hat{A}_{t}\right]=\hat{\mathbb{E}}_{t}\left[r_{t}(\theta) \hat{A}_{t}\right]
+$$
+其中，\(r_t(\theta)\)为重要性采样比率，上标\(CPI\)代表保守策略迭代（conservative policy iteration, Kakade & Langford, 2002）。通过对\(\pi_\theta\)与\(\pi_{\theta_{old}}\)之间的KL散度施加信任域约束，TRPO可确保每次策略更新不会与参考策略偏离过大。
+
+#### 近邻策略优化（Proximal Policy Optimization）
+然而，与TRPO类似，直接对\(L^{CPI}\)施加硬性KL约束在实际优化中难度较大。为解决这一问题，近邻策略优化（PPO，Schulman et al., 2017）对代理目标进行改进：通过惩罚使\(r_t(\theta)\)偏离1过远的策略更新，引入剪辑代理目标，具体形式如下：
+$$
+L^{CLIP}(\theta)=\hat{\mathbb{E}}_{(s_{t}, a_{t}) \sim \pi_{\theta_{old }}}\left[\min \left(r_{t}(\theta) \hat{A}_{t}, \text{clip}\left(r_{t}(\theta), 1-\epsilon, 1+\epsilon\right) \hat{A}_{t}\right)\right] \quad (4)
+$$
+
+这种剪辑机制有效定义了一个“软信任域”：\(r_t(\theta)\)被限制在1附近的小范围内，从而避免破坏性更新。与TRPO相比，PPO能实现相当的稳定性与效率。
+
+### 3 近邻监督微调
+近邻监督微调（PSFT）的目标是：在提升监督微调目标任务性能的同时，保留模型的通用能力、防止熵坍缩，并为后续优化预留空间。
+
+本文重新审视了强化学习中的TRPO与PPO目标函数：两种方法均依赖重要性采样比率\(r_t(\theta)\)对回报进行重加权，同时通过约束该比率防止新策略\(\pi_\theta\)与旧策略\(\pi_{\theta_{old}}\)过度偏离。
+
+将这一思路迁移到监督学习场景（假设所有动作均为“正确动作”，即\(\hat{A}_t>0\)），可将优势函数简化为\(\hat{A}_t=1\)，并由此定义近邻监督微调损失：
+$$
+L^{PSFT}(\theta )=\mathbb{E}_{(s_{t},a_{t})\sim \mathcal{D}}\left[ \min\left( \frac{\pi_{\theta}\left(a_{t} | s_{t}\right)}{\pi_{\theta_{old}}\left(a_{t} | s_{t}\right)}, \text{clip}\left( \frac{\pi_{\theta}\left(a_{t} | s_{t}\right)}{\pi_{\theta_{old}}\left(a_{t} | s_{t}\right)}, 1-\epsilon , 1+\epsilon \right) \right) \right] \quad (5)
+$$
+
+该目标函数通过限制新、旧策略概率比，对监督学习更新过程进行正则化。值得注意的是，本文允许旧策略\(\pi_{\theta_{old}}\)（而非固定的初始模型）动态演进——这一设计可直观地抑制token概率的过度自信更新，从而保留模型已有的能力。在在线场景下，该方法与标准监督微调训练等价。
+
+### 热身阶段（Warm-Up）
+需注意的是，公式（5）中的\((s_t, a_t)\)从离线数据集\(\mathcal{D}\)中采样。在训练初始阶段，由于\(\pi_{\theta_{old}}\)与\(\mathcal{D}\)的分布尚未对齐，\(r_t(\theta)\)可能导致期望偏差。剪辑机制虽能将策略更新约束在可接受范围内，间接降低这种偏差的负面影响，但仍可引入针对\(\mathcal{D}\)的监督微调热身阶段——通过该阶段使初始策略\(\pi_{\theta_{old}}\)与离线数据集更好地对齐，进一步提升监督微调/近邻监督微调的域内性能。
+
+### 3.2 梯度分析
+近邻监督微调的梯度更新被约束在信任域内，与PPO的梯度约束逻辑类似。其梯度可表示为：
+$$
+\begin{gathered} 
+\nabla_{\theta} L^{PSFT}(\theta)=\mathbb{E}_{\left(s_{t}, a_{t}\right) \sim \mathcal{D}}\left[r_{t} \cdot \mathbb{I}_{\text{trust}}\left(r_{t}\right) \cdot \nabla_{\theta} \log \pi_{\theta}\left(a_{t} | s_{t}\right)\right], \\ 
+\text{其中}\ \mathbb{I}_{\text{trust}}\left(r_{t}\right)=\begin{cases} 
+0 & r_{t}>1+\epsilon, \\ 
+1 & \text{其他情况}
+\end{cases}
+\end{gathered}
+$$
+
+梯度分析表明：若训练数据集分布与模型分布偏差显著，这些token将不会产生梯度，从而避免大幅策略更新，维持模型的泛化能力。通常，\(\epsilon\)的最优值设为0.2或0.28；如公式（6）所示，更大的\(\epsilon\)会导致梯度增大（相关进一步分析见5.2节）。
+
+## 实验
+### 主实验设置
+（1）**模型与数据集**：我们基于Qwen2.5-7B-Instruct（Yang等人，2025）和Llama3.1-8B-Instruct（Dubey等人，2024）两种模型评估所提方法。训练数据聚焦数学领域，旨在通过数学推理提升通用语言模型能力，采用的是OpenR1-Math-8192数据集（Face，2025）——该数据集包含长链思维（chain-of-thought, CoT）样本。  
+（2）**基线方法**：我们将标准SFT方法以及一种SFT变体（记为$SFT_{KL}$）作为基线。其中，$SFT_{KL}$在损失函数中融入了KL散度约束，KL正则化系数设为0.5；PSFT中的$\epsilon$参数固定为0.28。更多细节可参见附录A.1.1。
+
+### 4.1.1 训练动态
+我们首先分析了各方法的训练动态：对每种方法进行约10轮（epoch）训练，并绘制其熵值与性能的变化曲线。本节中，我们采用AIME-24数据集的avg@32指标衡量域内性能，采用GPQA（Rein等人，2024）数据集的avg@8指标衡量域外性能。
+
+**观察1：PSFT可避免熵坍缩**  避免过拟合
+**分析1：在熵值相近的情况下，PSFT的域内性能与标准SFT相当甚至更优**  
+**分析2：加入热身操作的PSFT性能优于标准SFT**  
+**分析3：PSFT能在很大程度上保留模型的泛化能力**
+
+### 4.1.2 详细评估
+#### 实验设置
+（1）**模型 checkpoint 选择**：为保证对比公平性，我们根据域内性能选择模型 checkpoint。例如，对于Qwen2.5-7B-Instruct模型，我们选用训练700步的SFT模型、训练900步的$SFT_{KL}$模型以及训练1300步的PSFT模型。  
+（2）**评估基准**：  
+- 域内任务：AIME24、AIME25、AMC、MATH-500（Hendrycks等人，2021）、OlympidBench（He等人，2024）、Minerva（Lewkowycz等人，2022）；  
+- 域外任务：GPQA（Rein等人，2024）、ARC-C（Clark等人，2018）、TruthfulQA（Lin等人，2021）、MMLUPro（Wang等人，2024）、SuperGPQA（Du等人，2025）、HeadQA（Vilares & Gómez-Rodríguez，2019）、IFEval（Zhou等人，2023）。  
+（3）**推理设置**：推理长度设为10240个token（IFEval任务设为4096个token），top-p参数为0.95，温度（temperature）为0.7。
+
+**分析1：带热身的PSFT在域内任务上持续优于标准SFT**  
+**分析2：PSFT展现出强劲的泛化能力** 
+**表2：域外性能详细结果（GPQA、ARC-C、TruthfulQA、IFEval采用avg@8指标，其余任务采用pass@1指标）**
+**分析3：PSFT在不同模型上均展现出稳健性** 
+
+### 4.2 强化学习阶段模型潜力的探索 
+实际应用中，语言模型（LLM）通常在SFT之后进行强化学习（RL）训练。经监督微调的模型需作为后续RL阶段的良好起点，既要避免过拟合与欠拟合，又要能更好地激发RL的优化潜力。本节中，我们评估了PSFT在RL阶段的作用。
+
+#### 实验设置
+我们采用了DAPO（Yu等人，2025）中的所有技术，将clip-higher参数设为0.28。RL训练使用DAPO-MATH-17k数据集（Shao等人，2024），详细训练配置可参见附录A.1.2。评估时，我们同样根据域内最高性能选择模型checkpoint。
+
+#### 4.2.1 强化学习阶段的训练动态
+（注：原文此处为图4，即“RL实验中的熵值训练动态”，包含Qwen2.5-7B-Instruct和Llama3.1-8B-Instruct两种模型的熵值变化曲线，曲线标注分别为PSFT+GRPO、SFT+GRPO）
+**分析1：PSFT为RL优化预留了更大空间**  
+**分析2：PSFT在RL阶段呈现“起步慢、追赶快”的特点**  
+#### 4.2.2 详细评估
+**分析3：RL后PSFT的域内性能更优** 
+**分析4：RL后PSFT在域外任务上的性能远超SFT**  
+
+### 4.3 人类对齐领域的进一步实验
+
+#### 实验设置
+为进一步验证PSFT的通用性，我们采用了完全不同的实验设置：  
+（1）**模型与数据集**：基于预训练的Qwen3-4B-Base模型（Yang等人，2025），使用UltraFeedback数据集（Cui等人，2023）进行微调。  
+（2）**训练算法**：首先在数据集中选取特定子集，分别用SFT/PSFT对模型进行微调（其中PSFT额外设置了“延长训练”版本，记为$PSFT_{prolong}$）；随后采用DPO算法，使模型学习对比奖励信号。  
+（3）**评估**：由于短CoT模型无法解决复杂问题，我们采用ARC、GSM8K（Cobbe等人，2021）、MMLU（Hendrycks等人，2020）、GPQA、TruthfulQA等任务评估对齐损失；在MT-Bench（Zheng等人，2024a）、AlpacaEval（Dubois等人，2024）、Arena-Hard（Li等人，2024a）三个对齐基准上评估模型对齐性能。评估时，采用Qwen3-30B-A3-Instruct-2507模型（Yang等人，2025）作为评判模型，并使用llm-eval-harness（Gao等人，2024）评估对齐损失性能。更多实验设置可参见附录A.1.3。
+
+#### 4.3.1 训练动态
+**分析1：PSFT在其他领域仍能可靠避免熵坍缩**
+
+#### 4.3.2 人类对齐性能
+**分析2：PSFT在对齐基准上表现更优** 
+**分析3：PSFT训练能充分利用正负样本** 
+**分析4：PSFT能有效降低对齐损失**
+### 5 深度分析
+#### 5.1 PSFT中的剪辑token
+图8展示了PSFT训练过程中具有代表性的剪辑token。可以看出，剪辑token主要集中在“wait（等待）”“alternatively（或者）”等表达不确定性的词汇上，这类词汇体现了某种“长期思维模式”，而这些思维模式本应在后续RL阶段中学习。随着训练的推进，这些token的剪辑权重愈发显著，而其他token的剪辑权重则逐渐减小。通过PSFT，这种“思维模式”被平稳地融入模型中，且未对模型的通用能力造成明显干扰。
+
+#### 5.2 剪辑值的参数分析
+如图9所示，无剪辑的PSFT虽能保持较高熵值，但存在梯度范数过大且不稳定、下游结果波动剧烈的问题。通过引入信任域剪辑机制，PSFT实现了更优的平衡：既防止了熵坍缩，稳定了梯度更新，又实现了性能的稳步提升。在不同剪辑阈值下，中等大小的$\epsilon$值（如0.28）在稳定性与性能之间展现出尤为理想的权衡效果。
+
+
 # 摘要
 基础模型的监督微调（SFT）往往会导致泛化能力不佳，即在新任务或新领域上微调后，模型原有的能力会退化。受强化学习（RL）中信任域策略优化（TRPO）和近邻策略优化（PPO）的启发，我们提出了近邻监督微调（Proximal SFT，简称PSFT）——一种融入了信任域优势的微调目标函数。该函数能在监督微调过程中有效约束策略偏移，同时保持具有竞争力的微调效果。通过将监督微调视为具有恒定正向优势的策略梯度方法的特例，我们推导出的PSFT不仅能使优化过程更稳定、提升模型泛化能力，还能为后续训练后阶段的进一步优化预留空间。在数学和人类价值这两个领域的实验表明：PSFT在域内性能上与SFT相当，在域外泛化能力上则优于SFT；在长时间训练下仍能保持稳定，且不会导致熵坍缩；同时，它还能为后续的优化提供更坚实的基础。
 
@@ -104,8 +243,6 @@ $$
 
 ### 4.1.1 训练动态
 我们首先分析了各方法的训练动态：对每种方法进行约10轮（epoch）训练，并绘制其熵值与性能的变化曲线。本节中，我们采用AIME-24数据集的avg@32指标衡量域内性能，采用GPQA（Rein等人，2024）数据集的avg@8指标衡量域外性能。
-
-![图1：熵值的训练动态（每178步为1轮）](注：原文此处为图1，包含Qwen2.5-7B-Instruct和Llama3.1-8B-Instruct两种模型的熵值变化曲线，曲线标注分别为SFT、SFT-KL、PSFT、PSFT（热身100步）、PSFT（热身200步）)
 
 **观察1：PSFT可避免熵坍缩**  
 图1展示了熵值的演变过程。与SFT和$SFT_{KL}$相比，PSFT的熵值曲线更为平滑；而SFT和$SFT_{KL}$每轮训练后熵值均呈现显著下降趋势，这表明它们存在潜在过拟合风险。这一结果说明，PSFT能够支持长期、token级的细粒度训练，且不会引发熵坍缩。值得注意的是，加入热身阶段的PSFT同样具备这种稳定性，且热身轮次对整体熵值水平具有关键影响（更多证据可参见图6a）。
